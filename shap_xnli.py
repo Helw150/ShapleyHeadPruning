@@ -30,40 +30,6 @@ from transformers.utils.versions import require_version
 import torch
 from torch.utils.data import DataLoader
 
-os.environ["CUDA_VISIBLE_DEVICES"] = str(get_free_gpu())
-reserve = torch.tensor(1)
-reserve.to("cuda:0")
-
-# The paper uses a custom finetuned version of XLM-R Base, but for convenience
-# I shifted to an available HuggingFace XNLI model
-model = AutoModelForSequenceClassification.from_pretrained(
-    "symanto/xlm-roberta-base-snli-mnli-anli-xnli"
-)
-tokenizer = AutoTokenizer.from_pretrained(
-    "symanto/xlm-roberta-base-snli-mnli-anli-xnli"
-)
-
-
-def preprocess_function(examples):
-    # Tokenize the texts
-    return tokenizer(
-        examples["premise"],
-        examples["hypothesis"],
-        padding="max_length",
-        max_length=128,
-        truncation=True,
-    )
-
-
-metric = load_metric("xnli")
-
-
-def compute_metrics(p: EvalPrediction):
-    preds = p.predictions[0] if isinstance(p.predictions, tuple) else p.predictions
-    preds = np.argmax(preds, axis=1)
-    return metric.compute(predictions=preds, references=p.label_ids)
-
-
 from collections import defaultdict
 import json
 import scipy.stats as st
@@ -96,9 +62,9 @@ def bernstein(sample):
     return mean - bern_bound, mean + bern_bound
 
 
-class DumbModel(torch.nn.Module):
+class MaskModel(torch.nn.Module):
     def __init__(self, real_model, head_mask, lang):
-        super(DumbModel, self).__init__()
+        super(MaskModel, self).__init__()
         self.contribs = defaultdict(self.construct_array)
         self.counter = 0
         self.prev = 1.0
@@ -109,6 +75,7 @@ class DumbModel(torch.nn.Module):
         self.prev_mask = torch.ones_like(head_mask).flatten()
         self.u = torch.zeros_like(head_mask).flatten()
         self.tracker = open(lang + "_tracker.txt", "a")
+        self.sample_limit = 5000
 
     def construct_array(self):
         return []
@@ -145,10 +112,9 @@ class DumbModel(torch.nn.Module):
         def active_memo(head):
             contribs = np.array(self.contribs[head])
             lower, upper = bernstein(contribs)
-            print(lower, upper, len(contribs))
-            if lower > -0.001:
+            if lower > -0.01:
                 return False
-            elif len(contribs) > 1000:
+            elif len(contribs) > self.sample_limit:
                 return False
             return True
 
@@ -201,7 +167,7 @@ class DumbModel(torch.nn.Module):
 
 
 # Invert Mask Order and Accuracy to do top down marginal contribution rather than bottom up
-def attribute_factory(model, thresh):
+def attribute_factory(model):
     def attribute(mask):
         mask = mask.flatten()
         if mask.sum() == 1:
@@ -230,6 +196,40 @@ def attribute_factory(model, thresh):
     return attribute
 
 
+os.environ["CUDA_VISIBLE_DEVICES"] = str(get_free_gpu())
+reserve = torch.tensor(1)
+reserve.to("cuda:0")
+
+# The paper uses a custom finetuned version of XLM-R Base, but for convenience
+# I shifted to an available HuggingFace XNLI model
+model = AutoModelForSequenceClassification.from_pretrained(
+    "symanto/xlm-roberta-base-snli-mnli-anli-xnli"
+)
+tokenizer = AutoTokenizer.from_pretrained(
+    "symanto/xlm-roberta-base-snli-mnli-anli-xnli"
+)
+
+
+def preprocess_function(examples):
+    # Tokenize the texts
+    return tokenizer(
+        examples["premise"],
+        examples["hypothesis"],
+        padding="max_length",
+        max_length=128,
+        truncation=True,
+    )
+
+
+metric = load_metric("xnli")
+
+
+def compute_metrics(p: EvalPrediction):
+    preds = p.predictions[0] if isinstance(p.predictions, tuple) else p.predictions
+    preds = np.argmax(preds, axis=1)
+    return metric.compute(predictions=preds, references=p.label_ids)
+
+
 from captum.attr import ShapleyValueSampling
 from transformers.utils import logging
 import json
@@ -238,7 +238,7 @@ logging.set_verbosity_error()
 langs = sys.argv[1].split(",")
 for eval_lang in langs:
     mask = torch.ones((1, 144)).to("cuda:0")
-    fake_model = DumbModel(model, mask, eval_lang)
+    fake_model = MaskModel(model, mask, eval_lang)
     args = transformers.TrainingArguments(
         "/data/wheld3/tmp", per_device_eval_batch_size=1024
     )
